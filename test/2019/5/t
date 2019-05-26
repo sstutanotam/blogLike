@@ -1,0 +1,781 @@
+# -*- coding: utf-8 -*-
+import json
+import sys
+import os
+import time
+import urllib
+from gevent import monkey
+from gevent.pool import Pool
+monkey.patch_all()
+import gevent  # pip3 install gevent
+from gevent import sleep
+import logging
+import logging.handlers
+from pprint import pprint
+import pymysql
+from queue import Queue
+import lxml.etree
+import ssl
+import chardet
+import random
+import socket
+import http.client
+from http import cookiejar
+import signal
+import hashlib
+import gzip
+import re
+# import re
+
+MAX_TRY = 2
+MAX_QUEUE_SIZE = 50
+MAX_BUF_LEN = 30
+SPEED = 10  # 用于控制爬取速率 越大越慢 可以和线程数配合使用线程数是越大越快
+
+
+def log(s):
+    try:
+        print(s)
+    except Exception as e:
+        print(e)
+
+
+def get_logger(loggerName):
+    '''
+    设置日志
+    logging.getLogger(loggerName)同一个loggerName获取的是同一个对象不可以重复添加Handler
+    '''
+    logger = logging.getLogger(loggerName)
+    if not os.path.isdir('log'):
+        os.mkdir('log')
+    logFile = os.path.join('log', 'Ygdy8.log')
+    # 最多备份15个日志文件，每个日志文件最大1M
+    Rthandler = logging.handlers.RotatingFileHandler(
+        logFile, maxBytes=1024 * 1024, backupCount=15)
+    Rthandler.setLevel(logging.WARNING)
+    fmt = logging.Formatter(
+        "%(name)12s: %(levelname)8s %(asctime)s -> %(message)s\n%(pathname)s/%(filename)s/funcName=%(funcName)s/lineno=%(lineno)d/threadName=%(threadName)s\n\n")
+    Rthandler.setFormatter(fmt)
+    logger.addHandler(Rthandler)
+    console = logging.StreamHandler()
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(name)12s: %(levelname)8s %(asctime)s -> %(message)s")
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+    return logger
+
+
+def get_charset(s):
+    return chardet.detect(s)['encoding']
+
+
+def pick_charset(html):
+    '''这个方法来自互联网 出处不详
+    从文本中提取 meta charset 比chardet要更准确
+    :param html bytes:
+    :return charset string:
+    '''
+    charset = None
+    m = re.compile(
+        b'<meta .*(http-equiv="?Content-Type"?.*)?charset="?([a-zA-Z0-9_-]+)"?',
+        re.I).search(html)
+    if m and m.lastindex == 2:
+        charset = m.group(2).lower()
+    return charset.decode()
+
+
+def _dict(the_dict, key):
+    if isinstance(the_dict, dict):
+        item = the_dict.get(key)
+        if item is None:
+            the_dict[key] = {}
+            return the_dict[key]
+        else:
+            return item
+    return None
+
+
+def hostReferer(url):
+    referer = ''
+    hosts = ''
+    index_s = url.find('://') + 3
+    if index_s > 2:
+        index_e = url[index_s:].find('/')
+        if index_e > -1:
+            referer = url[:index_e + index_s]
+            hosts = referer[index_s:]
+        else:
+            referer = url
+            hosts = referer[index_s:]
+        return (hosts, referer)
+    else:
+        return None
+
+
+def etreeHTML(html, charset):
+    return lxml.etree.HTML(
+        html, parser=lxml.etree.HTMLParser(
+            encoding=charset))
+
+
+class Browser():
+    '''
+    http_proxy = "http://127.0.0.1:8080"
+    https_proxy = "https://127.0.0.1:8080"
+    ftp_proxy = "ftp://127.0.0.1:8080"
+    proxyDict = {
+                  "http": http_proxy,
+                  "https": https_proxy,
+                  "ftp": ftp_proxy
+                }
+    proxy_handler = request.ProxyHandler(proxyDict)
+    # proxy_auth_handler = urllib.request.ProxyBasicAuthHandler()
+    # proxy_auth_handler.add_password('realm', 'host', 'username', 'password')
+    opener = request.build_opener(proxy_handler)  # ,proxy_auth_handler)
+    '''
+
+    def __init__(self):
+        self.log = get_logger('Browser')
+        self.openers_dict = {}
+        self.cookies_dict = {}
+        self.errors_dict = {}
+
+    def addError(self, err, url):
+        errType = type(err)
+        errors = self.errors_dict.get(url)
+        if errors is None:
+            self.errors_dict[url] = {}
+            self.errors_dict[url][errType] = 1
+        else:
+            errorTimes = errors.get(errType)
+            if isinstance(errorTimes, int) and errorTimes > 0:
+                errors[errType] = errorTimes + 1
+            else:
+                errors[errType] = 1
+
+    def get_opener(self, url, cookieFileName, proxy=None, hostsOpener=True):
+        '''
+        对于反爬厉害的网站或者 高并发 超快速爬取
+        你可能需要为每一次连接配置代理和cookie然后创建opener
+        那些对于爬虫不敏感的网站只需要为每个域名创建一个opener
+        '''
+        if hostsOpener:
+            hosts = hostReferer(url)
+            if hosts:
+                hosts = hosts[0]
+            if not hosts:
+                self.log.error(
+                    'In get_opener get hosts error : {}'.format(url))
+                return None
+            opener = self.openers_dict.get(hosts)
+            if opener:
+                return opener
+        else:
+            opener = self.openers_dict.get(url)
+            if opener:
+                return opener
+        cookie = cookiejar.MozillaCookieJar(cookieFileName)
+        cookieHandler = urllib.request.HTTPCookieProcessor(cookie)
+        if proxy and proxy.startswith('http://'):
+            proxy_handler = urllib.request.ProxyHandler({"http": proxy})
+            opener = urllib.request.build_opener(
+                cookieHandler, proxy_handler)  # ,proxy_auth_handler)
+        else:
+            opener = urllib.request.build_opener(cookieHandler)
+        if hostsOpener:
+            self.openers_dict[hosts] = opener
+            self.cookies_dict[hosts] = cookie
+        else:
+            self.openers_dict[url] = opener
+            self.cookies_dict[url] = cookie
+        return opener
+
+    def save_cookie(
+            self,
+            urlOrHosts,
+            ignore_discard=False,
+            ignore_expires=False):
+        cookie = self.cookies_dict.get(urlOrHosts)
+        if cookie:
+            cookie.save(
+                ignore_discard=ignore_discard,
+                ignore_expires=ignore_expires)
+
+    def get_content(self, url, opener, timeout, data=None):
+        self.log.debug('Connect >> {}'.format(url))
+        if opener is None:
+            self.log.warning('In get_content opener is None {}'.format(url))
+            return None
+        urllib.request.install_opener(opener)
+        hosts = hostReferer(url)
+        if hosts:
+            referer = hosts[1]
+            hosts = hosts[0]
+        else:
+            self.log.warning('url error in get_content : {}'.format(url))
+            return
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Encoding': 'gzip',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7',
+            'Connection': 'keep-alive',
+            'DNT': '1',
+            'Referer': referer + '/',
+            'Hosts': hosts,
+            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36',
+        }
+        html_text = None
+        _context = None
+        loop = 0
+        while loop < 3:
+            loop += 1
+            try:
+                req = urllib.request.Request(url, data, headers)
+                response = urllib.request.urlopen(
+                    req, timeout=timeout, context=_context)
+                # print('response.code', response.code)
+                if response.code == 200:
+                    html_text = response.read()
+                    cEncoding = response.info().get('Content-Encoding')
+                    # print('response.info()', response.info())
+                    if cEncoding and cEncoding.lower() == 'gzip':
+                        # print('cEncoding', cEncoding, url)
+                        html_text = gzip.decompress(html_text)
+                    # charset = response.info().get('charset')
+                    # print('charset----', charset)
+                    response.close()
+                    return html_text
+                response.close()
+            except urllib.request.HTTPError as e:
+                self.log.info('HTTPError : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                sleep(random.choice(range(5, 10)))
+            except urllib.request.URLError as e:
+                self.log.info('URLError : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                sleep(random.choice(range(5, 10)))
+            except socket.timeout as e:
+                self.log.info('socket.timeout : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                if loop == 1:
+                    sleep(random.choice(range(8, 15)))
+                    timeout = random.choice(range(timeout, timeout * 2))
+                elif loop == 2:
+                    sleep(random.choice(range(30, 60)))
+                    timeout = random.choice(range(timeout, timeout * 2))
+            except socket.error as e:
+                self.log.info('socket.error : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                sleep(random.choice(range(20, 60)))
+            except http.client.BadStatusLine as e:
+                self.log.info(
+                    'http.client.BadStatusLine : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                sleep(random.choice(range(30, 80)))
+            except http.client.IncompleteRead as e:
+                self.log.info(
+                    'http.client.IncompleteRead : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+                sleep(random.choice(range(5, 15)))
+            except ssl.CertificateError as e:
+                # 忽略证书错误
+                _context = ssl._create_unverified_context()
+                self.log.info(
+                    'ssl.CertificateError : {0} -> {1}'.format(e, url))
+                self.addError(e, url)
+            except Exception as e:
+                self.log.info(
+                    'get_content error : {0} => {1} {2}'.format(
+                        e, type(e), url))
+                self.addError(e, url)
+                break
+        return None
+
+
+class Spider:
+    loopCount = 0
+    retry = 0
+    run = True
+    bool_beep = False
+
+    def __init__(self, mainUrls, pool_size):
+        self.pool_size = pool_size
+        self.log = get_logger('Spider')
+        self.browser = Browser()
+        self.dict_url_queue = {}
+        self.dict_queuing = {}
+        for mainUrl in mainUrls.keys():
+            self.dict_url_queue[mainUrl] = Queue()
+            self.dict_queuing[mainUrl] = True
+        self.mainUrls = mainUrls
+        self.pool = Pool(pool_size)  # pool_size协程里线程数
+        self.dataDict = {}
+        self.dataDoneLen = {}
+
+    def getHtml(self, url, timeout, decodeIt=True):
+        cookieFileName = os.path.join(
+            'cookies', hashlib.md5(
+                url.encode('utf-8')).hexdigest())
+        if not os.path.isdir('cookies'):
+            os.mkdir('cookies')
+        retry = 0
+        while retry < MAX_TRY:
+            if not self.run:
+                break
+            if retry > 0:
+                sleepT = pow(2, retry)
+                if sleepT > 0:
+                    self.log.info(
+                        'retry getHtml wait {} seconds'.format(sleepT))
+                    sleep(sleepT)
+            ret_html = None
+            try:
+                opener = self.browser.get_opener(url, cookieFileName)
+                ret_html = self.browser.get_content(url, opener, timeout)
+            except Exception as e:
+                self.log.error(
+                    'get_content error : {0} {1}'.format(
+                        type(e), e))
+            if ret_html:
+                '''
+                fff = open('html_t', 'wb')
+                fff.write(ret_html)
+                fff.close()
+                '''
+                if decodeIt:
+                    charset = pick_charset(ret_html)
+                    # print('charset', charset, url)
+                    if not charset:
+                        charset = get_charset(ret_html)
+                    if charset:
+                        # print('charset', charset, url)
+                        return ret_html.decode(charset, errors='ignore')
+                    else:
+                        self.log.error(
+                            'ret_html charset error ! {}'.format(ret_html))
+                else:
+                    return ret_html
+            else:
+                retry += 1
+        return None
+
+    def loopPage(self, mainUrl):
+        timeout = random.choice(range(60, 120))
+        htmlData = self.getHtml(
+            mainUrl,
+            timeout)
+        if not htmlData:
+            self.log.error('In loopPage htmlData error >>> {}'.format(mainUrl))
+            return
+        mainKey = self.mainUrls[mainUrl]
+        dataDict = _dict(self.dataDict, mainKey)
+        # 空的字典代表False 用python这么多年居然刚知道 c语言里面只有空指针才是False
+        # a={}    if a:    print('a')    else:    Print('b')    >>>a
+        if dataDict is None:
+            self.log.error('In loopPage dataDict error: {}'.format(mainUrl))
+            return
+        queue = self.dict_url_queue[mainUrl]
+        self.getLinks(mainUrl, htmlData, dataDict, queue)
+        rootUrl = mainUrl[:mainUrl.rfind('/') + 1]
+        tree = etreeHTML(htmlData, 'utf-8')
+        pageUrls = tree.xpath(
+            '//div[@class="co_area2"]/div[@class="co_content8"]/div[@class="x"]/td/select[@name="sldd"]/option/@value')
+        pageUrls_len = len(pageUrls)
+        self.log.debug('In loopPage pageUrls length = {}'.format(pageUrls_len))
+        timeout = random.choice(range(30, 60))
+        for i in range(1, pageUrls_len):
+            while self.run and queue.qsize() > MAX_QUEUE_SIZE:
+                sleep(5)
+            if not self.run:
+                break
+            t_url = rootUrl + pageUrls[i]
+            htmlData = self.getHtml(
+                t_url,
+                timeout)
+            if not htmlData:
+                self.log.warning('In loopPage htmlData error {}'.format(t_url))
+                continue
+            self.getLinks(t_url, htmlData, dataDict, queue)
+        self.dict_queuing[mainUrl] = False
+
+    def getLinks(self, url, htmlData, dataDict, queue):
+        tree = etreeHTML(htmlData, 'utf-8')
+        a_items = tree.xpath(
+            '//div[@class="co_area2"]/div[@class="co_content8"]/ul/td/table/tr/td/b/a[@class="ulink"]')
+        self.log.debug('In getLinks links length = {}'.format(len(a_items)))
+        for a_item in a_items:
+            href = a_item.get('href')
+            if not href:
+                self.log.warning(
+                    'In getLinks href error {}'.format(url))
+                continue
+            if href.endswith('index.html'):
+                continue
+            # title = a_item.xpath('text()', encoding='utf-8')
+            title = a_item.xpath('text()')
+            if not title:
+                self.log.warning(
+                    'In getLinks title xpath error {}'.format(url))
+                continue
+            if len(title) == 1:
+                title = title[0]
+                if not title:
+                    self.log.warning(
+                        'In getLinks title error {}'.format(url))
+                    continue
+            else:
+                self.log.warning(
+                    'In getLinks title xpath length error {}'.format(url))
+                continue
+            '''
+            fff = open('titles.txt', 'a', encoding='utf-8')
+            fff.write(title + '\r\n')
+            fff.close()
+            '''
+            title = title.split('\n')[0]  # 只要第一行 一般也只有一行
+            hosts = hostReferer(url)
+            if hosts:
+                href = hosts[1] + href + '\n' + \
+                    title  # 用换行符分割 href只有一行 title也只有一行
+                queue.put(href)
+            else:
+                self.log.warning('In getLinks url error : {}'.format(url))
+                continue
+
+    def getData(self, url, dataDict, title):
+        ret = 0
+        title_dataDict = _dict(dataDict, title)
+        timeout = random.choice(range(30, 60))
+        htmlData = self.getHtml(
+            url,
+            timeout)
+        if not htmlData:
+            self.log.error('In getData htmlData error: {}'.format(url))
+            return ret
+        '''
+        fff = open('html_t_getData', 'w', encoding='utf-8')
+        fff.write(htmlData)
+        fff.close()
+        '''
+        tree = etreeHTML(htmlData, 'utf-8')
+        div_item = tree.xpath(
+            '//div[@class="co_area2"]/div[@class="co_content8"]//div[@id="Zoom"]')
+        if len(div_item) == 1:
+            div_item = div_item[0]
+            p_item = div_item.xpath('td/p')
+            if len(p_item) > 0:
+                p_item = p_item[0]
+                imgSrcs = p_item.xpath('img/@src')
+                if imgSrcs:
+                    ret += 1
+                self.log.debug(
+                    'In getData imgSrcs length = {}'.format(
+                        len(imgSrcs)))
+                img_dataDict = _dict(title_dataDict, 'imgs')
+                if not os.path.isdir('imgs'):
+                    os.mkdir('imgs')
+                imgsDir = os.path.join(
+                    'imgs', hashlib.md5(
+                        title.encode('utf-8')).hexdigest())
+                if not os.path.isdir(imgsDir):
+                    os.mkdir(imgsDir)
+                for imgSrc in imgSrcs:
+                    img = self.getHtml(imgSrc, timeout, decodeIt=False)
+                    if img:
+                        imgSrcMd5 = hashlib.md5(
+                            imgSrc.encode('utf-8')).hexdigest()
+                        imgFile = os.path.join(imgsDir, imgSrcMd5)
+                        with open(imgFile, 'wb') as f:
+                            f.write(img)
+                            f.close()
+                        img_dataDict[imgSrc] = imgFile
+                    else:
+                        self.log.warning(
+                            'In getData img error : {}'.format(imgSrc))
+                # 简单获取一下电影简介
+                # 如果你有兴趣可以自己写个函数使用re模块把电影简介的各个条目解析出来
+                # 比如电影评分之类的 要花点时间但是不难
+                moveText = lxml.etree.tostring(
+                    p_item, pretty_print=True, encoding='utf-8', method='html')
+                '''
+                fff = open('t_moveText', 'wb')
+                fff.write(moveText)
+                fff.close()
+                '''
+                moveText = moveText.decode('utf-8')
+                if moveText:
+                    ret += 1
+                    title_dataDict['moveText'] = moveText
+                else:
+                    self.log.warning(
+                        'In getData moveText error : {}'.format(url))
+            else:
+                self.log.warning('In getData p_item error : {}'.format(url))
+            a_item = div_item.xpath('td//table/tbody/tr/td/a')
+            if len(a_item) == 1:
+                a_item = a_item[0]
+                # 简单获取一下下载链接
+                downloadUrl = a_item.get('href')
+                ret += 1
+                title_dataDict['downloadUrl'] = downloadUrl
+            else:
+                self.log.warning('In getData a_item error : {}'.format(url))
+        else:
+            self.log.warning('In getData div_item error : {}'.format(url))
+        return ret
+
+    def process(self, mainUrl):
+        theTime = time.time()
+        mainKey = self.mainUrls[mainUrl]
+        dataDict = _dict(self.dataDict, mainKey)
+        if dataDict is None:
+            self.log.error('In processData dataDict error: {}'.format(mainUrl))
+            return
+        queue = self.dict_url_queue[mainUrl]
+        while self.run:
+            while self.run and queue.empty() and self.dict_queuing[mainUrl]:
+                sleep(5)
+            if not self.run and queue.empty():
+                break
+            queueVal = queue.get()
+            url = queueVal.split('\n')
+            if len(url) == 2:
+                title = url[1]
+                url = url[0]
+            else:
+                self.log.warning(
+                    'In processData queue.get() error : {}'.format(url))
+                continue
+            ret = self.getData(url, dataDict, title)
+            if ret:
+                queue.task_done()
+                if ret == 3:
+                    dataDoneLen = self.dataDoneLen.get(mainKey)
+                    if dataDoneLen is None:
+                        self.dataDoneLen[mainKey] = 0
+                    else:
+                        self.dataDoneLen[mainKey] = dataDoneLen + 1
+                else:
+                    del dataDict[title]
+            # else:
+            #     queue.put(queueVal)
+            self.loopCount += 1
+            while self.run and theTime + SPEED > time.time():
+                sleep(1)
+            # log('do', end='\r')
+            theTime = time.time()
+            if self.dataDoneLen.get(mainKey, 0) > MAX_BUF_LEN:
+                self.insert_into_db()
+
+    def sigint_handler(self, signum, frame):
+        # print(signum)
+        if signum == signal.SIGINT:
+            self.run = False
+            restart(self, restart=2)
+
+    def beep(self):
+        # 用于windows
+        if self.bool_beep:
+            os.system('TASKKILL /F /IM beep.exe /T')
+            # 我用c语言写了一个beep.exe用于播放声音
+            os.system('start /min beep.exe 1 3 1000 3700 500')
+
+    def beepLinux(self, times, cycle, sleepT):
+        while self.bool_beep and cycle:
+            t = times
+            while self.bool_beep and t:
+                os.system("paplay Beep_once.ogg")  # 需要下载一个Beep_once.ogg的音频文件
+                t -= 1
+            sleep(sleepT)
+            cycle -= 1
+
+    def insert_into_db(self):
+        with open('log/tttttttttt.json', 'w', encoding='utf-8') as f:
+            json.dump(
+                self.dataDict, f, sort_keys=True, indent=1, ensure_ascii=False)
+            f.close
+        print('test ok-----------------------------------------------------')
+        return
+        """
+        写入数据库
+        """
+        sql_create = '''create table if not exists {}(
+            ID INT  PRIMARY KEY AUTO_INCREMENT,
+            title text not null,
+            moveText text,
+            downloadUrl text,
+            imgFiles json
+        );'''
+        conn = pymysql.connect(
+            host="localhost",
+            port=3306,
+            user="user_test",
+            passwd="test_p",
+            db="newdb",
+            charset="utf8"
+        )
+        cursor = conn.cursor()
+        # for mainKey, dataDict in self.dataDict.items():
+        # 上面的写法报错：RuntimeError: dictionary changed size during iteration
+        # 一般协程不存在线程同步问题 但是字典在遍历时不能进行修改，建议转成列表或集合处理
+        # 初步判断由于写入数据库是IO操作会导致代码挂起 如果此时其他地方代码更改了dataDict就会报这个错
+        for mainKey in list(self.dataDict.keys()):  # 通过list函数转换为列表
+            dataDict = self.dataDict.get(mainKey)
+            if not dataDict:
+                continue
+            if mainKey:
+                sql = 'insert into {}(title, moveText, downloadUrl, imgFiles) values(%s, %s, %s, %s)'.format(
+                    mainKey)
+                try:
+                    cursor.execute(sql_create.format(mainKey))
+                    conn.commit()
+                except Exception as e:
+                    self.log.error(
+                        'In insert_into_db create table {}'.format(e))
+                    continue
+                # for title, title_dataDict in self.dataDict[mainKey].items():
+                # 上面的写法报错：RuntimeError: dictionary changed size during iteration
+                # 一般协程不存在线程同步问题 但是字典在遍历时不能进行修改，建议转成列表或集合处理
+                # 初步判断由于写入数据库是IO操作会导致代码挂起 如果此时其他地方代码更改了dataDict就会报这个错
+                for title in list(dataDict.keys()):  # 通过list函数转换为列表
+                    title_dataDict = dataDict.get(title)
+                    if not title_dataDict:
+                        continue
+                    try:
+                        moveText = title_dataDict['moveText']
+                        downloadUrl = title_dataDict['downloadUrl']
+                        imgFiles = json.dumps(title_dataDict['imgs'])
+                    except Exception as e:
+                        self.log.debug(
+                            'In insert_into_db get data frome dict {}\n\n{}'.format(
+                                e, title_dataDict))
+                        continue
+                    try:
+                        del dataDict[title]
+                        dataDoneLen = self.dataDoneLen.get(mainKey, 0)
+                        if dataDoneLen > 0:
+                            self.dataDoneLen[mainKey] = dataDoneLen - 1
+                    except Exception as e:
+                        self.log.error(
+                            'In insert_into_db del item error {}\n\n{}'.format(
+                                e, dataDict))
+                    try:
+                        cursor.execute(
+                            sql, (title, moveText, downloadUrl, imgFiles))
+                        conn.commit()
+                    except Exception as e:
+                        self.log.error(
+                            'In insert_into_db insert execute {}'.format(e))
+                        conn.rollback()
+        cursor.close()
+
+    def add_task(self, task, args=None, kwds=None, callback=None):
+        for i in range(self.pool_size):
+            self.pool.apply_async(
+                task, args=args, kwds=kwds, callback=callback)
+
+    def runSpider(self):
+        for mainUrl in self.mainUrls.keys():
+            self.pool.apply_async(self.loopPage, (mainUrl,))  # 获取任务占用一个线程
+            q = self.dict_url_queue[mainUrl]
+            while self.run and q.qsize() < MAX_QUEUE_SIZE:
+                sleep(5)
+            if not self.run:
+                break
+            self.add_task(self.process, (mainUrl,))  # 消费任务占用所有其他线程
+            while self.run and (self.dict_queuing[mainUrl] or q.qsize() > 0):
+                sleep(5)
+            if not self.run:
+                break
+
+
+def keeper(spider):
+    runing = spider.loopCount
+    spider.run = True
+    label = '-'
+    while spider.run:
+        progress = 0
+        while spider.run and progress < 60:
+            if label == '-':
+                print(label, end='\r')
+                label = '/'
+            elif label == '/':
+                print(label, end='\r')
+                label = '\\'
+            elif label == '\\':
+                print(label, end='\r')
+                label = '-'
+            sleep(5)
+            progress += 1
+        # print('O', end='\r')
+        if runing == spider.loopCount:
+            sleepT = pow(2, spider.retry)
+            if sleepT > 0:
+                log('restart from keeper wait {} seconds'.format(sleepT))
+                sleep(sleepT)
+            spider.retry += 1
+            restart(spider)
+        else:
+            runing = spider.loopCount
+            spider.retry = 0
+            # sleep(10)
+
+
+def restart(spider, restart=1):
+    '''
+    restart=1 保存数据并重启
+    restart=2 保存数据并退出
+    restart=3 重启
+    '''
+    global logger
+    try:
+        spider.run = False
+        if restart == 1 or restart == 2:
+            spider.insert_into_db()
+        if restart == 1 or restart == 3:
+            spider.beep()
+            log('restart.........')
+            python = sys.executable
+            # os.execl() 在windows下没如我预期那样工作 linux下是正常的
+            # os.execl(python, os.path.basename(python), sys.argv[0], str(spider.retry))
+            os.system(python + ' ' + sys.argv[0] + ' ' + str(spider.retry))
+            # sys.exit(0)
+    except Exception as ee:
+        logger.error('{0} In restart {1}'.format(type(ee), ee))
+        sys.exit(0)
+
+
+def main():
+    global logger
+    try:
+        logger = get_logger('ygdy8')
+        mainUrls = {}
+        mainUrls['https://www.ygdy8.com/html/gndy/oumei/index.html'] = '欧美电影'
+        pool_size = 30  # 最小为3 keeper占用一个线程 loopPage获取任务占用一个线程 process消费任务占用其他线程
+        spider = Spider(mainUrls, pool_size)
+        # 按Ctrl-c完美退出  SIGINT = Ctrl-c
+        signal.signal(signal.SIGINT, spider.sigint_handler)
+        if len(sys.argv) > 1:
+            spider.retry = int(sys.argv[1])
+        spider.run = True
+        spider.bool_beep = True
+        spider.pool.apply_async(keeper, (spider,))  # keeper占用一个线程
+        spider.runSpider()
+        '''
+        jobs = [
+            gevent.spawn(
+                keeper, spider), gevent.spawn(
+                spider.runSpider)]
+        gevent.joinall(jobs)
+        '''
+    except Exception as e:
+        logger.error('{0} In main {1}'.format(type(e), e))
+        restart(spider)
+
+
+if __name__ == "__main__":
+    log('start..........................')
+    main()
+    log('stop __________________________')
